@@ -3,18 +3,26 @@
 ## Aissa Feldmann, modifying Tim Howard's code from June 2012. Date 21 May 2013, NYNHP.
 
 ## FINAL RUN
-
+library(here)
 library(raster)
+library(arcgisbinding)
+arc.check_product()
 
-#change the path below to your working directory
-setwd("C:/Aissa/__EPA_wetlands/LCA2/tifs2")
-    
 #set a mask; change the path below to the snap raster in your working directory
-msk <- raster("C:/Aissa/__EPA_wetlands/LCA2/tifs2/snapras30met.tif")
+msk <- raster(here("inputs","raster","LCM_domain_30m.tif"))
+
+# location of rasters. If geodatabase, make sure to add extension
+ras.dir <- here("inputs", "LCM_dataprep", "LCM_data_20190723")
+rules <- read.csv(here("inputs", "rules.csv"), header = T)
+
+# using arc to load rasters
+# gdb <- here("inputs", "LCM_dataprep", "LCM_data_20190723.gdb")
+# r <- as.raster(arc.raster(arc.open(paste0(gdb, "/transport_rdlah_2000m"))))
 
 #set up the distance decay function and weight (a, b, scalar=100 (distance of 2000 m divided by 20), w, decdist) 
 #for each layer. These do not need to change.
 
+# TODO: Create a standalone table and import this data
 rules <- matrix( data= c(
         "ALIS_PrimHwyLimAcc_dist2k.tif", 5, 1, 100, 500, 1000,
         "ALIS_PrimHwyWOLimAcc_dist2k.tif", 5, 1, 100, 500, 1000,
@@ -30,17 +38,17 @@ rules <- matrix( data= c(
 		    "cs_allag2_dist2k.tif", 1, 5, 100, 300, 200,
 		    "CCAP_05_OpenSpaces_dist2k.tif", 1, 5, 100, 300, 200			
         ), ncol = 6, byrow = TRUE)
-
-rules <- as.data.frame(rules)
-names(rules) <-  c("filename", "a", "b", "scalar", "weight", "decdist")
-rules$a <- as.numeric(levels(rules$a))[rules$a]
-rules$b <- as.numeric(levels(rules$b))[rules$b]
-rules$scalar <- as.numeric(levels(rules$scalar))[rules$scalar]
-rules$weight <- as.numeric(levels(rules$weight))[rules$weight]
-rules$decdist <- as.numeric(levels(rules$decdist))[rules$decdist]
+rules <- data.frame(rules)
+names(rules) <- c("filename", "a", "b", "scalar", "weight", "decdist")
+rules <- transform(rules, a = as.numeric(a), b = as.numeric(b), scalar = as.numeric(scalar), weight = as.numeric(weight), decdist = as.numeric(decdist))
+# rules$a <- as.numeric(levels(rules$a))[rules$a]
+# rules$b <- as.numeric(levels(rules$b))[rules$b]
+# rules$scalar <- as.numeric(levels(rules$scalar))[rules$scalar]
+# rules$weight <- as.numeric(levels(rules$weight))[rules$weight]
+# rules$decdist <- as.numeric(levels(rules$decdist))[rules$decdist]
 
 #2013 sigmoid function for calculations	 
-fun <- function(x) { 
+fun <- function(x, d) { 
     x[x>dist] <- NA  #clear out the irrelevant vals
     if(dist == 0){ 
         x[x==0] <- wt
