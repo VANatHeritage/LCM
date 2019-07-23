@@ -1,2 +1,3 @@
 # LCM
-Pennsylvania Landscape Condition Model
+
+Natural Heritage Network Landscape Condition Model
