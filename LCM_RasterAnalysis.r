@@ -1,9 +1,10 @@
-## This code is for applying - here in NY - the "Landscape Condition" methods developed 
-## by Colorado NHP/Co State. See SHRP 2 C21A April 2012. 
+## This code applies "Landscape Condition" methods developed 
+## by Colorado NHP/Co State (See SHRP 2 C21A April 2012). This 2019 revision
+## (by David Bucklin, Virginia NHP) adds methods to help with large extent/high 
+## resolution analyses at the state level.
 ## Aissa Feldmann, modifying Tim Howard's code from June 2012. Date 21 May 2013, NYNHP.
 
 # Make sure input rasters, weights, etc, are assigned in rules.xlsx
-
 library(here)
 library(raster)
 library(snow)
@@ -23,7 +24,7 @@ rules1 <- read_excel(here("rules.xlsx"))
 ext <- st_read(here("inputs","LCM_domain.shp"))
 
 # location of distance rasters. If geodatabase, make sure to add extension
-ras.dir <- "L:/David/projects/LCM_temp/LCM_data_full_30m_20190802.gdb"
+ras.dir <- "L:/David/projects/LCM_temp/LCM_data_full_10m_20190829.gdb"
 proj.name <- gsub(".gdb$", "", basename(ras.dir))
 if (grepl(".gdb$", ras.dir)) ras <- arc.open(ras.dir)@children$RasterDataset else ras <- list.files(ras.dir, pattern = ".tif$", full.names = F)
 
@@ -40,7 +41,7 @@ rules$filename_ext <- NULL
 print(rules$filename)
 write.csv(rules, file = paste0("rules.csv"), row.names = F)
 
-blksz <- 9000 # side-length of raster processing blocks, in pixels. Optimized for using 9-11 cores with 32 GB memory
+blksz <- 9000 # side-length of raster processing blocks, in pixels. Optimized for using 9 cores with 32 GB memory
 
 obj <- arc.raster(arc.open(rules$full_path[1]))
 rext <- obj$extent
@@ -65,7 +66,8 @@ for (i in 1:nrow(blocks)) {
   blocks$end_row[i] <- (abs(bb[2] - obj$extent[4])) / obj$cellsize[2]
   blocks$end_col[i] <- (bb[3] - obj$extent[1]) / obj$cellsize[1]
 }
-plot(blocks["id"])
+plot(blocks["id"], reset = FALSE, main = "processing blocks")
+plot(ext$geometry, add = T, col = NA, reset = T)
 st_write(blocks, "blocks.shp", delete_layer = T)
 suppressWarnings(st_write(ext, "ext.shp", delete_layer = T))
 dir.create("rawImpact")
@@ -110,12 +112,14 @@ for (blk in 1:nrow(blocks)) {
     file <- paste0(tdir, "/", flnm , "_calc", blkid, ".tif")
     r2 = arc.raster(NULL, path = file, dim=dim(tempr), pixel_type="F32", 
                     nodata=tempr$nodata, extent=tempr$extent, sr=tempr$sr, overwrite = T)
-      v <- r$pixel_block(ul_y = sub[1], nrow = sub[2]-sub[1], ul_x = sub[3], ncol = sub[4] - sub[3])
-      #if (!all(is.na(v))) {
-        v[v > dist] <- NA
-        v[!is.na(v)] <- (1/(1+(exp(((v[!is.na(v)]/scal)-shift)*spread))))*wt
-        r2$write_pixel_block(v, nrow = sub[2]-sub[1])
-      #}
+      
+    v <- r$pixel_block(ul_y = sub[1], nrow = sub[2]-sub[1], ul_x = sub[3], ncol = sub[4] - sub[3])
+      
+    # v1 decdist function  
+    v[v > dist] <- NA
+    v[!is.na(v)] <- (1/(1+(exp(((v[!is.na(v)]/scal)-shift)*spread))))*wt
+    
+    r2$write_pixel_block(v, nrow = sub[2]-sub[1])
     r2$commit(opt = c("build-pyramid"))
     return(file)
   })

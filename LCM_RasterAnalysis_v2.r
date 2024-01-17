@@ -1,18 +1,23 @@
-## This code is for applying - here in NY - the "Landscape Condition" methods developed 
-## by Colorado NHP/Co State. See SHRP 2 C21A April 2012. 
-## Aissa Feldmann, modifying Tim Howard's code from June 2012. Date 21 May 2013, NYNHP.
+## This code attempts to recreate "Landscape Condition" methods used 
+## by Hak and Comer (2017) for the NatureServe Landscape Condition model,
+## with methods that help with large extent/high resolution (cluster processing in blocks)
+## for analyses at the state level.
+
+## Date created: 2019-08-01
+## Author: David Bucklin, Virginia Natural Heritage Program
+## Reworks an earlier verion used by several natural heritage programs (PA, NY, CO)
 
 # Make sure input rasters, weights, etc, are assigned in rules.xlsx
-
 library(here)
 library(raster)
 library(snow)
-library(arcgisbinding)
+library(arcgisbinding) # see https://r-arcgis.github.io/assets/arcgisbinding-vignette.html
 library(sf)
 library(readxl)
 library(fasterize)
 arc.check_product()
 delete.temp <- TRUE # delete intermediate files after completion?
+cat.combo <- TRUE #  combine impact rasters by category, then calculate product?
 
 dt <- gsub("-","",Sys.Date())
 rasterOptions(tmpdir = "L:/scratch/raster") # set this to a folder with enough disk space for temp rasters
@@ -24,9 +29,9 @@ rules1 <- read_excel(here("rules.xlsx"))
 ext <- st_read("C:/David/scratch/jurisbnd_lam_clipbound.shp")
 
 # location of distance rasters. If geodatabase, make sure to add extension
-ras.dir <- "L:/David/projects/LCM_temp/LCM_data_full_5m_20190802.gdb"
+ras.dir <- "L:/David/projects/LCM_temp/LCM_data_full_10m_20190829.gdb"
 proj.name <- gsub(".gdb$", "", basename(ras.dir))
-proj.name <- paste0(proj.name, "_v2")
+proj.name <- paste0(proj.name, "_v2_run", dt)
 if (grepl(".gdb$", ras.dir)) ras <- arc.open(ras.dir)@children$RasterDataset else ras <- list.files(ras.dir, pattern = ".tif$", full.names = F)
 
 # create output directory/reload if exists
@@ -46,13 +51,13 @@ if (dir.exists(out.dir)) {
   
   # make rules table for this analysis
   rules <- data.frame(filename_ext = ras, filename = gsub(".tif","",ras))
-  rules <- merge(rules, rules1, by = "filename")
+  rules <- merge(rules, rules1[c("filename", "category", "name", "siteindex", "distthresh")], by = "filename")
   rules$full_path <- paste0(ras.dir, "/", rules$filename_ext)
   rules$filename_ext <- NULL
   print(rules$filename)
   write.csv(rules, file = paste0("rules.csv"), row.names = F)
   
-  blksz <- 9000 # side-length of raster processing blocks, in pixels. Optimized for using 9 cores with 32 GB memory
+  blksz <- 9000 # side-length of raster processing blocks, in pixels. Optimized for using 9 cores with 32 GB RAM. Use a smaller number if less RAM available
   
   obj <- arc.raster(arc.open(rules$full_path[1]))
   rext <- obj$extent
@@ -81,78 +86,100 @@ if (dir.exists(out.dir)) {
   suppressWarnings(st_write(ext, "ext.shp", delete_layer = T))
 }
 
-plot(blocks["id"])
+plot(blocks["id"], reset = FALSE, main = "processing blocks")
+plot(ext$geometry, add = T, col = NA, reset = T)
 dir.create("rawImpact")
 
 # process blocks
-print(system.time({
-  for (blk in 1:nrow(blocks)) {
-    # arc method w/ chunk processing
-    if (blk == 1) {
-      message("Starting cluster...")
-      tdir <- paste0(dirname(ras.dir), "/", proj.name, "_temp")
-      dir.create(tdir, showWarnings = F)
-      
-      # cluster apply, should be faster when many cores available
-      # using too many cores + large blocks can bog down system due to high memory usage
-      cl <- makeCluster(min(9, nrow(rules)), type = "SOCK")  # max arc clusters appears to be 9.
-      
-      clusterEvalQ(cl, library(arcgisbinding))
-      clusterCall(cl, arc.check_product) # takes a while, can error if too many cores (>9; maybe due to an Arc license issue)
-      clusterExport(cl, c("ras.dir","tdir"))
-    }
+for (blk in 2:nrow(blocks)) {
+  removeTmpFiles(1)
+  t0 <- as.numeric(Sys.time())
+  # arc method w/ chunk processing
+  if (blk == 1) {
+    message("Starting cluster...")
+    tdir <- paste0(dirname(ras.dir), "/", proj.name, "_temp")
+    dir.create(tdir, showWarnings = F)
     
-    # get block info
-    block <- blocks[blk,]
-    blkid <- block$id
-    if (file.exists(paste0("rawImpact/prodImpact", blkid, ".tif"))) next
-    sub <- c(block$start_row, block$end_row, block$start_col, block$end_col)
-    blkrast <- paste0(tempfile(), ".tif")
-    tempr <- arc.raster(NULL, path=blkrast, extent=st_bbox(block), 
-                       nrow=block$end_row-block$start_row, ncol=block$end_col-block$start_col, 
-                       nband=1, pixel_type="F32", sr=obj$sr, overwrite=TRUE)
-    clusterExport(cl, c("tempr","sub", "blkid"))
+    # cluster apply, should be faster when many cores available
+    # using too many cores + large blocks can bog down system due to high memory usage
+    cl <- makeCluster(min(9, nrow(rules)), type = "SOCK")  # max arc clusters appears to be 9.
     
-    # process raster values
-    message("Creating impact rasters for block ", blkid, "...")
-    out <- parApply(cl, rules, 1, FUN = function(x) {
-      flnm <- x["filename"]
-      r <- arc.raster(arc.open(x["full_path"]))
-      file <- paste0(tdir, "/", flnm , "_calc", blkid, ".tif")
-      r2 = arc.raster(NULL, path = file, dim=dim(tempr), pixel_type="F32", 
-                      nodata=tempr$nodata, extent=tempr$extent, sr=tempr$sr, overwrite = T)
-      v <- r$pixel_block(ul_y = sub[1], nrow = sub[2]-sub[1], ul_x = sub[3], ncol = sub[4] - sub[3])
-      
-      # v2 decdist function (see LCM_impact_fn.R)
-      si <- as.numeric(x["siteindex"])
-      ds <- as.numeric(x["distthresh"])
-      # if (!all(is.na(v))) {
-        v[!is.na(v)] <- (1/(1+exp(-2*((v[!is.na(v)]-(ds*0.5))/(ds*0.25))))) ^ (-0.25*log(si)) #-8*10-16)
-        r2$write_pixel_block(v, nrow = sub[2]-sub[1])
-      # }
-      
-      r2$commit(opt = c("build-pyramid"))
-      return(file)
-    })
-    
-    arc.delete(blkrast)
-    
-    stk <- stack(out)
-    stk <- stackSave(stk, paste0("ImpactRasters", blkid, ".stk"))
-    # stk <- stackOpen(paste0("ImpactRasters", blkid, ".stk"))
-    
-    # v2: product of impact rasters
-    message("Combining impact rasters...")
-    fun <- function(x) {
-      if (all(is.na(x))) return(1) else return(prod(x, na.rm=T))
-    }
-    # uses cluster from above
-    ras2 <- clusterR(stk, calc, args = list(fun = fun), cl = cl, 
-                     filename = paste0("rawImpact/prodImpact", blkid, ".tif"), overwrite = TRUE)
-    
-    if (blk == nrow(blocks)) stopCluster(cl)
+    clusterEvalQ(cl, library(arcgisbinding))
+    clusterCall(cl, arc.check_product) # takes a while, can error if too many cores (>9; maybe due to an Arc license issue)
+    clusterExport(cl, c("ras.dir","tdir"))
   }
-}))
+  
+  # get block info
+  block <- blocks[blk,]
+  blkid <- block$id
+  if (file.exists(paste0("rawImpact/prodImpact", blkid, ".tif"))) next
+  sub <- c(block$start_row, block$end_row, block$start_col, block$end_col)
+  blkrast <- paste0(tempfile(), ".tif")
+  tempr <- arc.raster(NULL, path=blkrast, extent=st_bbox(block), 
+                     nrow=block$end_row-block$start_row, ncol=block$end_col-block$start_col, 
+                     nband=1, pixel_type="F32", sr=obj$sr, overwrite=TRUE)
+  clusterExport(cl, c("tempr","sub", "blkid"))
+  
+  # process raster values
+  message("Creating impact rasters for block ", blkid, "...")
+  out <- parApply(cl, rules, 1, FUN = function(x) {
+    flnm <- x["filename"]
+    r <- arc.raster(arc.open(x["full_path"]))
+    file <- paste0(tdir, "/", flnm , "_calc", blkid, ".tif")
+    r2 = arc.raster(NULL, path = file, dim=dim(tempr), pixel_type="F32", 
+                    nodata=tempr$nodata, extent=tempr$extent, sr=tempr$sr, overwrite = T)
+    v <- r$pixel_block(ul_y = sub[1], nrow = sub[2]-sub[1], ul_x = sub[3], ncol = sub[4] - sub[3])
+    
+    si <- as.numeric(x["siteindex"])
+    ds <- as.numeric(x["distthresh"])
+    
+    # v2 decdist function (see LCM_impact_fn.R)
+    v[!is.na(v)] <- (1/(1+exp(-2*((v[!is.na(v)]-(ds*0.5))/(ds*0.25))))) ^ (-0.25*log(si)) #-8*10-16)
+    r2$write_pixel_block(v, nrow = sub[2]-sub[1])
+    
+    r2$commit(opt = c("build-pyramid"))
+    return(file)
+  })
+  
+  arc.delete(blkrast)
+  stk <- stack(out)
+  
+  # combine by category (optional)
+  if (cat.combo) {
+    stkout <- list()
+    cats <- unique(rules$category)
+    system.time({
+    for (ca in cats) {
+      message("   Creating ", ca, " category raster...")
+      stk0 <- stk[[names(stk)[grepl(names(stk), pattern = paste0("^",ca))]]]
+      fun <- function(x) {
+        # take the minimum value of all impact rasters for the category
+        if (all(is.na(x))) return(1) else return(min(x, na.rm=T))
+      }
+      # uses cluster from above
+      catras <- clusterR(stk0, calc, args = list(fun = fun), cl = cl)
+      stkout[[ca]] <- catras 
+    }
+    stk <- stack(stkout)
+    })
+  }
+  
+  stk <- stackSave(stk, paste0("ImpactRasters", blkid, ".stk"))
+  # stk <- stackOpen(paste0("ImpactRasters", blkid, ".stk"))
+  
+  # v2: product of impact rasters (either by category, or all)
+  message("Combining impact rasters...")
+  fun <- function(x) {
+    if (all(is.na(x))) return(1) else return(prod(x, na.rm=T))
+  }
+  # uses cluster from above
+  ras2 <- clusterR(stk, calc, args = list(fun = fun), cl = cl, 
+                   filename = paste0("rawImpact/prodImpact", blkid, ".tif"), overwrite = TRUE)
+  
+  if (blk == nrow(blocks)) stopCluster(cl)
+  t1 <- as.numeric(Sys.time())
+  message("That took ", round((t1-t0)/60) , " minutes.")
+}
 
 if (delete.temp) {
   unlink(tdir, recursive = T, force = T)
@@ -160,12 +187,12 @@ if (delete.temp) {
 }
 
 #############
-# restart from here if already finished previous steps, setting project folder below
+# restart from here if already finished previous steps, setting proj.name below to the project's folder name
 #############
 
 library(here)
 delete.temp <- T # delete intermediate files after completion?
-proj.name <- "LCM_data_full_30m_20190802_v2"
+proj.name <- proj.name #"LCM_data_full_30m_20190802_v2"
 setwd(here("outputs", proj.name))
 blocks <- st_read("blocks.shp")
 ext <- st_read("ext.shp")
@@ -173,7 +200,7 @@ ext <- st_read("ext.shp")
 #  process product rasters
 lr <- list.files(path = "rawImpact", pattern = "Impact.*tif$", full.names = T)
 rlist <- lapply(lr, raster)
-cl <- makeCluster(min(length(rlist), parallel::detectCores()-1), type = "SOCK") 
+cl <- makeCluster(min(length(rlist), parallel::detectCores()-2), type = "SOCK") 
 
 print(system.time({
   clusterEvalQ(cl, library(raster))
@@ -182,7 +209,7 @@ print(system.time({
   clusterEvalQ(cl, library(sf))
   clusterExport(cl, c("blocks","ext","delete.temp"))
   
-  # rescale to integer (multiply values)
+  # rescale to integer (multiply values by 10k). Smallest value is 0.0001
   # also masks (only if necessary), using 'ext' polygon
   dir.create("final")
   rasSumRescl <- parLapply(cl, rlist, fun = function(x) {
@@ -202,25 +229,26 @@ print(system.time({
   )
   stopCluster(cl)
 }))
+if (delete.temp) unlink("rawImpact", recursive = T)
 
 
 #########################
 
-# mosaic (optional; would take a long time)
-# system.time({
-#   names(rasSumRescl)[1:2] <- c('x', 'y')
-#   rasSumRescl$fun <- max
-#   rasSumRescl$na.rm <- TRUE
-#   rasSumRescl$filename <- "LandscapeCondition.tif"
-#   rasSum <- do.call(mosaic, rasSumRescl)
-# })
+# mosaic (optional; can take a long time)
+if (nrow(blocks) < 30) {
+system.time({
+  names(rasSumRescl)[1:2] <- c('x', 'y')
+  rasSumRescl$fun <- max
+  rasSumRescl$na.rm <- TRUE
+  rasSumRescl$filename <- "LandscapeCondition.tif"
+  rasSum <- do.call(mosaic, rasSumRescl)
+})
+}
 # plot(rasSum)
-
 #########################
 
 # create pyramids/stats
 message("Building pyramids/statistics...")
-writeLines(text = gsub("%SUB%", getwd(), readLines(here("inputs","pyr.py"))), con = here("inputs","pyr2.py"))
+suppressWarnings(writeLines(text = gsub("%SUB%", getwd(), readLines(here("inputs","pyr.py"))), con = here("inputs","pyr2.py")))
 system2("C:/Program Files/ArcGIS/Pro/bin/Python/Scripts/propy.bat", here("inputs","pyr2.py"), wait = T)
 file.remove(here("inputs","pyr2.py"))
-if (delete.temp) unlink("rawImpact", recursive = T)
